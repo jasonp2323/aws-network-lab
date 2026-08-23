@@ -30,7 +30,7 @@ These are settled. Do not reopen them.
 | State | HCP Terraform, VCS-driven workspaces (not S3/DynamoDB) |
 | AWS auth | OIDC dynamic credentials, no static keys anywhere |
 | Access | SSM Session Manager only — no public IPs, no bastion, no SSH keys |
-| Endpoints | Interface endpoints (ssm, ssmmessages, ec2messages, logs) in **every** VPC |
+| Endpoints | Interface endpoints (ssm, ssmmessages, ec2messages, logs) in the **app** spoke (3 AZ) and **shared** spoke (1 AZ) — 16 ENIs. Egress hub and dev spoke get none |
 | DNS | A subdomain delegated to Route53; the hosted zone is persistent |
 | Lifecycle | Everything destroyable; torn down between sessions to stop the meter |
 

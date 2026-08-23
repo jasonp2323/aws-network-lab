@@ -292,7 +292,7 @@ The one exception is `bootstrap/`, which runs locally with local state. It canno
     {
       path: "modules/alb/",
       change: "added",
-      note: "ALB, target group, HTTP/HTTPS listeners, ACM cert, access-log bucket + policy.",
+      note: "ALB, target group, HTTP/HTTPS listeners, ACM cert, access-log bucket + policy. Also the mismatched-name cert that scenario 6 swaps in.",
     },
     {
       path: "modules/asg-wordpress/",
@@ -312,7 +312,7 @@ The one exception is `bootstrap/`, which runs locally with local state. It canno
     {
       path: "modules/alarms/",
       change: "added",
-      note: "SNS topic + the ALB 5xx / UnHealthyHostCount / TargetResponseTime alarms.",
+      note: "SNS topic + the ALB 5xx / UnHealthyHostCount / TargetResponseTime alarms, and the RequestCount-to-zero alarm scenario 6 depends on.",
     },
     {
       path: "envs/network/",
@@ -327,7 +327,7 @@ The one exception is `bootstrap/`, which runs locally with local state. It canno
     {
       path: "envs/app/",
       change: "added",
-      note: "Workspace aws-lab-app. ALB, ASG, alarms. Consumes network + shared outputs.",
+      note: "Workspace aws-lab-app. ALB, ASG, alarms. Consumes network + shared outputs, plus the Route53 zone id and name from bootstrap — set by hand, because bootstrap keeps local state.",
     },
     {
       path: "envs/platform/",
@@ -378,7 +378,7 @@ The one exception is `bootstrap/`, which runs locally with local state. It canno
       "aws-lab-app",
       "envs/app/",
       "ALB, ACM, ASG, alarms",
-      "network + shared",
+      "network + shared + bootstrap",
       "~5 min",
     ],
   ]}
@@ -387,7 +387,7 @@ The one exception is `bootstrap/`, which runs locally with local state. It canno
 
 ### Apply order and dependencies
 
-Cross-workspace values move through the `tfe_outputs` data source rather than `terraform_remote_state`. **Remote state sharing has to be explicitly enabled on each producer workspace** — otherwise the consumer's data source returns a 404 that reads like a permissions error. Wire run triggers `network → shared → app` so a network apply queues the downstream plans automatically.
+Cross-workspace values move through the `tfe_outputs` data source rather than `terraform_remote_state`. `bootstrap/` is the exception: local state cannot be read that way, so `route53_zone_id` and `route53_zone_name` are copied into `aws-lab-app` as workspace variables once, by hand. **Remote state sharing has to be explicitly enabled on each producer workspace** — otherwise the consumer's data source returns a 404 that reads like a permissions error. Wire run triggers `network → shared → app` so a network apply queues the downstream plans automatically.
 
 Build it in this order, verifying each step before the next:
 
@@ -403,7 +403,7 @@ Build it in this order, verifying each step before the next:
       id: "s1",
       label:
         "Create the four HCP workspaces, set working directories, enable remote state sharing",
-      note: "Attach the OIDC variable set (TFC_AWS_PROVIDER_AUTH, TFC_AWS_RUN_ROLE_ARN) to all four.",
+      note: "Attach the OIDC variable set (TFC_AWS_PROVIDER_AUTH, TFC_AWS_RUN_ROLE_ARN, TFC_AWS_RUN_ROLE_SESSION_DURATION=3600) to all four — HCP requests 900s otherwise, which is shorter than a four-attachment TGW destroy. Then set route53_zone_id and route53_zone_name as Terraform variables on aws-lab-app.",
     },
     {
       id: "s2",
@@ -487,7 +487,7 @@ TGW attachments and VPC interface endpoints are the two largest lines, and both 
       "VPC interface endpoints",
       "16 ENIs",
       "0.160",
-      "4 endpoints × (app 3 AZ + shared 1 AZ). Biggest reducible line.",
+      "4 endpoints × (app 3 AZ + shared 1 AZ). Egress hub and dev spoke deliberately get none. Biggest reducible line.",
     ],
     ["NAT gateway", "1", "0.045", "Plus $0.045/GB processed."],
     [
@@ -535,7 +535,7 @@ The point of the logging here is not coverage, it is **discrimination**: given a
 
 **TGW flow logs are enabled alongside VPC flow logs.** They record which TGW route table made the decision, turning "TGW is probably the problem" into evidence.
 
-**The `logs` interface endpoint is local to each VPC**, not reached over TGW. If CloudWatch ingestion depended on the TGW path, then breaking TGW would also destroy the evidence of breaking TGW.
+**The `logs` interface endpoint is local to every VPC you break**, not reached over TGW. If CloudWatch ingestion depended on the TGW path, then breaking TGW would also destroy the evidence of breaking TGW. That means the app spoke in all three AZs and the shared spoke in one; the dev spoke ships over the TGW because nothing is ever broken underneath it.
 
 <Code
   id="flowlog-code"
@@ -665,11 +665,11 @@ Read the last column as the answer key — do the diagnosis first, then check wh
     ],
     [
       "6",
-      "Expired certificate",
-      "Swap the listener cert for a self-signed one with a past notAfter",
-      "TLS handshake fails at the ALB",
+      "Broken TLS at the listener",
+      "Point the listener certificate_arn at an ACM cert for wrong.lab.<yourdomain>",
+      "Clients abort the handshake; no request ever reaches the ALB",
       "NOTHING. No 5xx, targets healthy, latency normal, and the request never appears in access logs",
-      "ClientTLSNegotiationErrorCount on the ALB, and ACM DaysToExpiry. Confirm from outside with openssl s_client -connect.",
+      "RequestCount falling to zero is the signal that survives. ClientTLSNegotiationErrorCount should climb with it — confirm that it does, since the abort is client-side. Reproduce from outside with openssl s_client -connect.",
     ],
   ]}
   density="compact"
@@ -681,7 +681,11 @@ Read the last column as the answer key — do the diagnosis first, then check wh
 
 That gap is the lesson: _you cannot alarm on the absence of requests unless you decide to._ The lab therefore also alarms on `RequestCount` dropping to zero, which is the only signal that catches this class of failure.
 
-Two mechanical notes. ACM will not import an already-expired certificate, so the swap uses a self-signed cert generated with a past `notAfter` and attached to the listener directly. And an ALB does **not** validate backend certificates at all — so an expired cert on the _targets_ changes nothing, which is why this scenario has to live on the frontend listener to be observable.
+**This cannot be staged as a real expiry, so do not try.** An ALB listener accepts an ACM or an IAM server certificate ARN and nothing else. ACM refuses to import a certificate past its `notAfter`, and IAM refuses it too — "the certificate must be valid at the time of upload… [not] after it expires". There is no third path to a listener, so the trigger breaks the handshake by *identity* rather than by date: issue a second ACM cert for `wrong.lab.<yourdomain>`, DNS-validated in the hosted zone you already control, and swap `certificate_arn` to it. The client is offered a name it did not ask for and hangs up. A self-signed cert with *valid* dates uploaded to IAM gives the same server-side signature failing on trust instead of name, if you want the other flavour.
+
+**The alarm you actually want cannot be exercised here, and that is worth saying out loud.** In production the thing that catches this is ACM `DaysToExpiry` — a leading indicator, which by definition no on-demand trigger can fire. The lab can only reproduce the aftermath. So the failure you can stage and the alarm you should run are not the same one, and `RequestCount` at zero is what covers the gap between them.
+
+An ALB does **not** validate backend certificates at all, so a bad cert on the _targets_ changes nothing. This scenario has to live on the frontend listener to be observable.
 
 </Callout>
 
@@ -729,7 +733,7 @@ These are the ones you specifically asked about, plus the neighbours that tend t
           type: "rich-text",
           data: {
             markdown:
-              "**Session Manager needs three endpoints — `ssm`, `ssmmessages`, `ec2messages` — and missing `ssmmessages` is the classic error**, because the agent registers successfully and appears healthy in Fleet Manager while sessions refuse to open.\n\n**Private DNS requires both `enableDnsSupport` and `enableDnsHostnames` on the VPC.** Without them the endpoint exists, resolves to the public IP, and quietly routes over your NAT instead.\n\n**Endpoint private DNS does not work across VPCs over TGW.** A VPC without its own endpoint resolves `ssm.us-east-1.amazonaws.com` to the public address regardless of what its neighbour has. Sharing endpoints cross-VPC requires Route53 Resolver rules — which is why each instance-bearing VPC gets its own set.\n\n**The egress hub gets no endpoints**, because it runs no instances. It is easy to build all three VPCs identically out of habit and pay $0.04/hr for nothing.\n\n**Endpoint security groups need 443 inbound from the VPC CIDR.** The default SG will not do it, and the failure looks like a hung session rather than a refused one.\n\nThe reason all of this earns its cost: local endpoints mean SSM and CloudWatch Logs both survive every TGW and NAT failure you inject. You keep your shell, and you keep the evidence.",
+              "**Session Manager needs three endpoints — `ssm`, `ssmmessages`, `ec2messages` — and missing `ssmmessages` is the classic error**, because the agent registers successfully and appears healthy in Fleet Manager while sessions refuse to open.\n\n**Private DNS requires both `enableDnsSupport` and `enableDnsHostnames` on the VPC.** Without them the endpoint exists, resolves to the public IP, and quietly routes over your NAT instead.\n\n**Endpoint private DNS does not work across VPCs over TGW.** A VPC without its own endpoint resolves `ssm.us-east-1.amazonaws.com` to the public address regardless of what its neighbour has. Sharing endpoints cross-VPC requires Route53 Resolver rules — which is why every VPC whose shell must survive a broken route gets its own set.\n\n**Endpoints go where you break things, not everywhere.** The app spoke gets all four in all three AZs and the shared spoke gets them in one — sixteen ENIs, which is the figure in the cost table. The egress hub gets none because it runs no instances. The dev spoke gets none either: it reaches SSM over the TGW and the hub NAT, and no scenario in this lab breaks dev's path while also needing a shell on dev. (A staged missing hop 5 does cut dev's return traffic, but you observe that one from the app spoke.) If you ever add a scenario that breaks dev while you need to be inside it, give dev its own endpoints first, or you will lose the shell you need to watch it fail.\n\n**Endpoint security groups need 443 inbound from the VPC CIDR.** The default SG will not do it, and the failure looks like a hung session rather than a refused one.\n\nThe reason all of this earns its cost: local endpoints mean SSM and CloudWatch Logs both survive every TGW and NAT failure you inject. You keep your shell, and you keep the evidence.",
           },
         },
       ],
