@@ -1,0 +1,882 @@
+---
+# Visual plan: open https://plan.agent-native.com/plans/plan-5fd4d12f3c7f4f18 in a browser for the canvas and review UI.
+visualUrl: "https://plan.agent-native.com/plans/plan-5fd4d12f3c7f4f18"
+title: "TGW Hub-and-Spoke SRE Lab"
+brief: "A four-VPC AWS lab where Transit Gateway routing is load-bearing, built for break/fix and RCA practice."
+version: 1
+---
+
+### Objective
+
+Build an AWS environment in **us-east-1** where a WordPress application cannot reach its database or the internet unless Transit Gateway routing is correct, then deliberately break it six different ways and prove each root cause from logs. The deliverable is not a running product — it is a rig you can destroy and rebuild in ~15 minutes, plus a runbook of failure scenarios with known-correct evidence trails.
+
+**Done means:** `curl https://lab.<yourdomain>` returns a WordPress page served by an ASG across 3 AZs; the app reaches RDS only via TGW; all egress leaves through a single NAT gateway in a separate hub VPC; the `app` and `dev` spokes cannot reach each other; and each of the six failure scenarios has been triggered once and root-caused from the log source named in its row.
+
+**In scope:** three-plus-one VPC topology, TGW with per-attachment route tables, ALB + ASG + RDS, SSM-only access, flow logs / ALB access logs / CloudTrail / CloudWatch agent + alarms, and the failure runbook.
+
+**Not in scope:** high availability that survives a region, WordPress performance or theming, secrets rotation, multi-account or Organizations structure, and CI beyond the HCP Terraform VCS pipeline itself.
+
+The four design questions this plan opened with are now settled — see **Decisions** at the bottom for what was chosen and what each choice buys.
+
+### Topology and TGW route tables
+
+Four VPCs attach to one Transit Gateway. Each attachment is associated with **its own** TGW route table, and every route is static. The route tables — not security groups, and not VPC peering — are what decide who can talk to whom.
+
+<Diagram id="topology-diagram" caption={"Each attachment associates to exactly one TGW route table. app has no route to 10.30/16 and dev has no route to 10.10/16, so spoke-to-spoke traffic has nowhere to go."} frame="show">
+
+```html
+<div class="tgw-map"><div class="col"><div class="diagram-card" data-rough><div class="ttl">app spoke</div><div class="cidr">10.10.0.0/16</div><div class="diagram-pill">ALB &middot; public /24 &times;3</div><div class="diagram-pill">ASG WordPress &middot; private /24 &times;3</div><div class="diagram-pill">tgw-attach /28 &times;3</div></div><div class="diagram-card" data-rough><div class="ttl">dev spoke</div><div class="cidr">10.30.0.0/16</div><div class="diagram-pill">1 &times; t3.micro &mdash; isolation prover</div><div class="diagram-pill">tgw-attach /28 &times;1</div></div></div><div class="diagram-panel hub" data-rough><div class="ttl">Transit Gateway</div><div class="cidr">default association + default propagation DISABLED &middot; static routes only</div><div class="rt"><b>tgw-rt-app</b><span>10.20/16 &rarr; shared &nbsp;&middot;&nbsp; 0.0.0.0/0 &rarr; egress</span><em>no route to 10.30/16</em></div><div class="rt"><b>tgw-rt-shared</b><span>10.10/16 &rarr; app &nbsp;&middot;&nbsp; 10.30/16 &rarr; dev &nbsp;&middot;&nbsp; 0.0.0.0/0 &rarr; egress</span></div><div class="rt"><b>tgw-rt-dev</b><span>10.20/16 &rarr; shared &nbsp;&middot;&nbsp; 0.0.0.0/0 &rarr; egress</span><em>no route to 10.10/16</em></div><div class="rt"><b>tgw-rt-egress</b><span>10.10/16 &rarr; app &nbsp;&middot;&nbsp; 10.20/16 &rarr; shared &nbsp;&middot;&nbsp; 10.30/16 &rarr; dev</span></div></div><div class="col"><div class="diagram-card" data-rough><div class="ttl">shared spoke</div><div class="cidr">10.20.0.0/16</div><div class="diagram-pill">RDS MySQL multi-AZ &middot; data /24 &times;3</div><div class="diagram-pill">Prometheus + Grafana &middot; mgmt /24 &times;3</div><div class="diagram-pill">tgw-attach /28 &times;3</div></div><div class="diagram-card" data-rough><div class="ttl">egress hub</div><div class="cidr">10.0.0.0/16</div><div class="diagram-pill">NAT gateway &times;1 &middot; az-a</div><div class="diagram-pill">IGW &middot; public /24 &times;3</div><div class="diagram-pill">tgw-attach /28 &times;3 &middot; no EC2</div></div></div></div>
+```
+
+```css
+.tgw-map{display:grid;grid-template-columns:1fr 1.35fr 1fr;gap:14px;align-items:start}
+.tgw-map .col{display:flex;flex-direction:column;gap:14px}
+.tgw-map .diagram-card{padding:12px;display:flex;flex-direction:column;gap:6px}
+.tgw-map .ttl{font-weight:600;color:var(--wf-ink)}
+.tgw-map .cidr{color:var(--wf-muted);font-size:.84em}
+.tgw-map .diagram-pill{font-size:.8em}
+.hub{padding:14px;display:flex;flex-direction:column;gap:9px;border-color:var(--wf-accent)}
+.hub .rt{display:flex;flex-direction:column;gap:3px;padding:8px 10px;border:1px solid var(--wf-line);border-radius:6px;background:var(--wf-card)}
+.hub .rt b{color:var(--wf-accent);font-size:.9em}
+.hub .rt span{font-size:.8em;color:var(--wf-ink);line-height:1.5}
+.hub .rt em{font-size:.78em;color:var(--wf-warn);font-style:normal}
+@media (max-width:760px){.tgw-map{grid-template-columns:1fr}}
+```
+
+</Diagram>
+
+<Table
+  id="reach-matrix"
+  columns={[
+    "From \\\\ To",
+    "app 10.10/16",
+    "shared 10.20/16",
+    "dev 10.30/16",
+    "0.0.0.0/0",
+  ]}
+  rows={[
+    ["app", "—", "reachable", "BLOCKED — no route", "via egress NAT"],
+    ["shared", "reachable", "—", "reachable", "via egress NAT"],
+    ["dev", "BLOCKED — no route", "reachable", "—", "via egress NAT"],
+    [
+      "egress",
+      "reachable (return)",
+      "reachable (return)",
+      "reachable (return)",
+      "IGW",
+    ],
+  ]}
+  density="compact"
+/>
+
+<Callout id="static-routes-callout" tone="decision">
+
+**Static routes, not propagation.** Both `default_route_table_association` and `default_route_table_propagation` are disabled on the TGW, and no attachment propagates into any route table. Every entry is an explicit `aws_ec2_transit_gateway_route`.
+
+Propagation would be less typing, but it makes routes appear and disappear automatically as attachments come and go — which means the _missing route_ and _blackhole_ scenarios become awkward to stage and easy to accidentally self-heal. Static routes make TGW genuinely load-bearing and let you break it from Terraform with a one-line change. `blackhole = true` is a first-class argument on that resource.
+
+</Callout>
+
+### CIDR plan
+
+The second octet identifies the VPC on sight — `10.0.x` egress, `10.10.x` app, `10.20.x` shared, `10.30.x` dev. When you are reading raw flow-log lines at 2am during a mock incident, that saves you looking anything up.
+
+TGW attachment subnets are dedicated `/28`s per AWS guidance: the attachment ENIs get their own subnets so they never compete for addresses with workloads, and so you can reason about the attachment's route table independently.
+
+<Table
+  id="cidr-table"
+  columns={["VPC", "VPC CIDR", "Subnet tier", "az-a", "az-b", "az-c"]}
+  rows={[
+    [
+      "egress (hub)",
+      "10.0.0.0/16",
+      "public — NAT + IGW",
+      "10.0.0.0/24",
+      "10.0.1.0/24",
+      "10.0.2.0/24",
+    ],
+    [
+      "egress",
+      "",
+      "tgw-attach",
+      "10.0.240.0/28",
+      "10.0.240.16/28",
+      "10.0.240.32/28",
+    ],
+    [
+      "app (spoke)",
+      "10.10.0.0/16",
+      "public — ALB only",
+      "10.10.0.0/24",
+      "10.10.1.0/24",
+      "10.10.2.0/24",
+    ],
+    [
+      "app",
+      "",
+      "private — ASG + endpoints",
+      "10.10.10.0/24",
+      "10.10.11.0/24",
+      "10.10.12.0/24",
+    ],
+    [
+      "app",
+      "",
+      "tgw-attach",
+      "10.10.240.0/28",
+      "10.10.240.16/28",
+      "10.10.240.32/28",
+    ],
+    [
+      "shared (spoke)",
+      "10.20.0.0/16",
+      "data — RDS",
+      "10.20.10.0/24",
+      "10.20.11.0/24",
+      "10.20.12.0/24",
+    ],
+    [
+      "shared",
+      "",
+      "mgmt — Prometheus/Grafana",
+      "10.20.20.0/24",
+      "10.20.21.0/24",
+      "10.20.22.0/24",
+    ],
+    [
+      "shared",
+      "",
+      "tgw-attach",
+      "10.20.240.0/28",
+      "10.20.240.16/28",
+      "10.20.240.32/28",
+    ],
+    ["dev (spoke)", "10.30.0.0/16", "private", "10.30.10.0/24", "—", "—"],
+    ["dev", "", "tgw-attach", "10.30.240.0/28", "—", "—"],
+    ["reserved", "10.40.0.0/16 +", "future spokes", "—", "—", "—"],
+  ]}
+  density="compact"
+/>
+
+### Intra-VPC routing — where this actually breaks
+
+TGW route tables are only half the path. Every packet also crosses two or three **VPC** route tables, and centralized egress has a return path that is easy to omit and produces a failure that looks like a firewall problem rather than a routing one.
+
+Trace one outbound request and its return below. Hop 5 is the one that gets missed.
+
+<Diagram id="egress-diagram" caption={"Centralized egress, both directions. The return path is not symmetric with the outbound path — it re-enters the TGW from the egress VPC's public subnets, which is why hop 5 must exist."} frame="show">
+
+```html
+<div class="egress"><div class="lane"><div class="lane-label">outbound</div><div class="hops"><div class="diagram-node">ASG instance<small>10.10.10.x</small></div><div class="step">1</div><div class="diagram-node">app private RT<small>0.0.0.0/0 &rarr; tgw</small></div><div class="step">2</div><div class="diagram-node">tgw-rt-app<small>0.0.0.0/0 &rarr; egress attach</small></div><div class="step">3</div><div class="diagram-node">egress attach RT<small>0.0.0.0/0 &rarr; nat</small></div><div class="step">4</div><div class="diagram-node">NAT gateway<small>10.0.0.0/24 az-a</small></div><div class="diagram-node">IGW</div></div></div><div class="lane"><div class="lane-label">return</div><div class="hops"><div class="diagram-node">IGW</div><div class="diagram-node">NAT gateway</div><div class="step warn">5</div><div class="diagram-node warnnode">egress <b>public</b> RT<small>10.0.0.0/8 &rarr; tgw</small></div><div class="step">6</div><div class="diagram-node">tgw-rt-egress<small>10.10/16 &rarr; app attach</small></div><div class="diagram-node">ASG instance</div></div></div><div class="foot">Hop 5 lives in the <b>public</b> subnet route table of the egress VPC, next to the 0.0.0.0/0 &rarr; IGW entry. Omit it and outbound works, DNS works, and every connection hangs until it times out.</div></div>
+```
+
+```css
+.egress{display:flex;flex-direction:column;gap:14px}
+.lane{display:flex;flex-direction:column;gap:6px}
+.lane-label{font-size:.75em;letter-spacing:.08em;text-transform:uppercase;color:var(--wf-muted)}
+.hops{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px}
+.hops .diagram-node{display:flex;flex-direction:column;gap:2px;padding:8px 10px;min-width:110px;font-size:.84em}
+.hops .diagram-node small{color:var(--wf-muted);font-size:.85em}
+.hops .warnnode{border-color:var(--wf-warn)}
+.step{display:flex;align-items:center;justify-content:center;min-width:22px;font-size:.78em;color:var(--wf-muted)}
+.step.warn{color:var(--wf-warn);font-weight:700}
+.foot{font-size:.84em;color:var(--wf-muted);line-height:1.6;border-top:1px solid var(--wf-line);padding-top:10px}
+```
+
+</Diagram>
+
+<Table
+  id="vpcrt-table"
+  columns={["VPC / subnet tier", "Route entries", "Why"]}
+  rows={[
+    [
+      "egress · public",
+      "0.0.0.0/0 → IGW  +  10.0.0.0/8 → TGW",
+      "Second entry is the NAT return path. Missing it = every spoke connection hangs.",
+    ],
+    [
+      "egress · tgw-attach",
+      "0.0.0.0/0 → NAT GW",
+      "Sends spoke egress arriving from TGW into the NAT.",
+    ],
+    [
+      "app · public",
+      "0.0.0.0/0 → IGW",
+      "ALB only. Never point this at the TGW — the ALB would blackhole its own replies.",
+    ],
+    [
+      "app · private",
+      "0.0.0.0/0 → TGW  +  10.20.0.0/16 → TGW",
+      "Default covers RDS too; the explicit entry makes intent readable when you are diffing route tables under pressure.",
+    ],
+    ["app · tgw-attach", "local only", "Attachment ENIs originate nothing."],
+    [
+      "shared · data",
+      "10.10.0.0/16 → TGW",
+      "RDS replies to the app. No default route — the database has no business reaching the internet.",
+    ],
+    [
+      "shared · mgmt",
+      "0.0.0.0/0 → TGW  +  10.10.0.0/16 → TGW",
+      "Prometheus scrapes app targets and needs egress for package installs.",
+    ],
+    [
+      "dev · private",
+      "0.0.0.0/0 → TGW + 10.20.0.0/16 → TGW",
+      "Deliberately has no app route at either VPC or TGW level.",
+    ],
+  ]}
+  density="compact"
+/>
+
+<Callout id="egress-callout" tone="risk">
+
+**The failure mode of a missing hop 5 is a hang, not an error.** Outbound SYN reaches the internet, the SYN-ACK reaches the NAT gateway, and the NAT has no route back to 10.10.0.0/16 — so the packet is dropped inside the egress VPC. From the instance it looks exactly like a security group or NACL blocking return traffic, and `curl` just sits there until it times out.
+
+The tell is in the flow logs: the egress VPC's NAT ENI shows the inbound reply as ACCEPT, and the app instance's ENI shows nothing coming back. Worth staging on purpose once, because it is the single most common centralized-egress mistake and it does not resemble a routing problem from inside the box.
+
+</Callout>
+
+### Repository and HCP Terraform workspaces
+
+State lives in HCP Terraform, so there is no `backend "s3"` block and no DynamoDB lock table. Applies happen in HCP runs triggered by merges to `main`, not from your laptop. Each workspace is VCS-driven against a **working directory** in one repo.
+
+The one exception is `bootstrap/`, which runs locally with local state. It cannot live in HCP because it creates the IAM OIDC provider and role that HCP uses to authenticate to AWS — the workspace would need the role to exist in order to create the role. Run it once from your machine and keep its state file out of git.
+
+`bootstrap/` also owns the **Route53 hosted zone**, and that placement is deliberate rather than tidy-minded. Destroying and recreating a hosted zone issues a fresh set of NS records, which would mean re-delegating at your registrar every single session. The zone is created once and survives every teardown.
+
+<FileTree
+  id="filetree"
+  title="Repository layout"
+  entries={[
+    {
+      path: "bootstrap/oidc.tf",
+      change: "added",
+      note: "IAM OIDC provider for app.terraform.io + assumable role. Local state, run once.",
+    },
+    {
+      path: "bootstrap/dns.tf",
+      change: "added",
+      note: "Route53 hosted zone for lab.<yourdomain>. PERSISTENT — never destroyed.",
+    },
+    {
+      path: "bootstrap/README.md",
+      change: "added",
+      note: "The manual NS-delegation step at your registrar, and how to verify it with dig.",
+    },
+    {
+      path: "modules/vpc/",
+      change: "added",
+      note: "VPC, subnets by tier, route tables, IGW, flow logs. Reused 4x.",
+    },
+    {
+      path: "modules/tgw/",
+      change: "added",
+      note: "TGW plus the four route tables, associations, and static routes. The load-bearing module.",
+    },
+    {
+      path: "modules/tgw-attachment/",
+      change: "added",
+      note: "Per-VPC attachment + explicit route-table association. Separated so spokes can attach without importing the TGW module.",
+    },
+    {
+      path: "modules/egress/",
+      change: "added",
+      note: "NAT gateway, EIP, and the asymmetric return routing that makes centralized egress work.",
+    },
+    {
+      path: "modules/vpc-endpoints/",
+      change: "added",
+      note: "ssm, ssmmessages, ec2messages, logs interface endpoints + free S3 gateway endpoint.",
+    },
+    {
+      path: "modules/alb/",
+      change: "added",
+      note: "ALB, target group, HTTP/HTTPS listeners, ACM cert, access-log bucket + policy.",
+    },
+    {
+      path: "modules/asg-wordpress/",
+      change: "added",
+      note: "Launch template, ASG, instance profile, user-data. Bootstraps over TGW on purpose.",
+    },
+    {
+      path: "modules/rds/",
+      change: "added",
+      note: "Subnet group, parameter group, multi-AZ instance. skip_final_snapshot for clean destroy.",
+    },
+    {
+      path: "modules/monitoring-host/",
+      change: "added",
+      note: "Prometheus + Grafana on one instance in the shared spoke.",
+    },
+    {
+      path: "modules/alarms/",
+      change: "added",
+      note: "SNS topic + the ALB 5xx / UnHealthyHostCount / TargetResponseTime alarms.",
+    },
+    {
+      path: "envs/network/",
+      change: "added",
+      note: "Workspace aws-lab-network. All four VPCs, the TGW, all attachments and routes.",
+    },
+    {
+      path: "envs/shared/",
+      change: "added",
+      note: "Workspace aws-lab-shared. RDS + monitoring host. Consumes network outputs.",
+    },
+    {
+      path: "envs/app/",
+      change: "added",
+      note: "Workspace aws-lab-app. ALB, ASG, alarms. Consumes network + shared outputs.",
+    },
+    {
+      path: "envs/platform/",
+      change: "added",
+      note: "Workspace aws-lab-platform. CloudTrail + log buckets. Independent of the others.",
+    },
+    {
+      path: "docs/runbook.md",
+      change: "added",
+      note: "The six failure scenarios, their symptoms, and the proving log source.",
+    },
+  ]}
+/>
+
+<Table
+  id="workspace-table"
+  columns={["Workspace", "Working dir", "Owns", "Consumes", "Rebuild time"]}
+  rows={[
+    [
+      "— (local)",
+      "bootstrap/",
+      "OIDC role, Route53 zone",
+      "nothing",
+      "once, never destroyed",
+    ],
+    [
+      "aws-lab-platform",
+      "envs/platform/",
+      "CloudTrail, log buckets",
+      "nothing",
+      "~2 min",
+    ],
+    [
+      "aws-lab-network",
+      "envs/network/",
+      "4 VPCs, TGW, attachments, routes, flow logs, endpoints",
+      "bootstrap (role ARN)",
+      "~5 min",
+    ],
+    [
+      "aws-lab-shared",
+      "envs/shared/",
+      "RDS multi-AZ, Prometheus/Grafana",
+      "network",
+      "~10 min (RDS dominates)",
+    ],
+    [
+      "aws-lab-app",
+      "envs/app/",
+      "ALB, ACM, ASG, alarms",
+      "network + shared",
+      "~5 min",
+    ],
+  ]}
+  density="compact"
+/>
+
+### Apply order and dependencies
+
+Cross-workspace values move through the `tfe_outputs` data source rather than `terraform_remote_state`. **Remote state sharing has to be explicitly enabled on each producer workspace** — otherwise the consumer's data source returns a 404 that reads like a permissions error. Wire run triggers `network → shared → app` so a network apply queues the downstream plans automatically.
+
+Build it in this order, verifying each step before the next:
+
+<Checklist
+  id="order-checklist"
+  items={[
+    {
+      id: "s0",
+      label: "bootstrap/ locally — OIDC provider, IAM role, Route53 zone",
+      note: "Then add the four NS records at your registrar and confirm with `dig +short NS lab.<yourdomain>` before going further. Everything downstream depends on this resolving.",
+    },
+    {
+      id: "s1",
+      label:
+        "Create the four HCP workspaces, set working directories, enable remote state sharing",
+      note: "Attach the OIDC variable set (TFC_AWS_PROVIDER_AUTH, TFC_AWS_RUN_ROLE_ARN) to all four.",
+    },
+    {
+      id: "s2",
+      label: "aws-lab-platform — CloudTrail and log buckets",
+      note: "First, so every subsequent API call in the lab is already recorded. This is what makes 'who changed the security group' answerable later.",
+    },
+    {
+      id: "s3",
+      label: "aws-lab-network — VPCs and subnets only, TGW commented out",
+      note: "Verify subnets and route tables exist as planned before adding the thing that connects them.",
+    },
+    {
+      id: "s4",
+      label:
+        "aws-lab-network — add TGW, attachments, route tables, static routes",
+      note: "Verify with `aws ec2 search-transit-gateway-routes` per route table. Confirm tgw-rt-app has NO 10.30.0.0/16 entry.",
+    },
+    {
+      id: "s5",
+      label: "aws-lab-network — NAT gateway and the egress return route",
+      note: "Verify from the dev-spoke instance over SSM: `curl -sS https://checkip.amazonaws.com` should return the NAT's EIP.",
+    },
+    {
+      id: "s6",
+      label:
+        "aws-lab-network — SSM/logs interface endpoints + S3 gateway endpoint",
+      note: "Verify SSM works with the NAT route temporarily blackholed. If the shell dies, the endpoints are wrong and every later scenario will lock you out.",
+    },
+    {
+      id: "s7",
+      label: "aws-lab-shared — RDS multi-AZ and the monitoring host",
+      note: "Verify from a dev-spoke instance: `mysql -h <endpoint>` should connect. From the app spoke it will not work yet — the SG is not open.",
+    },
+    {
+      id: "s8",
+      label: "aws-lab-app — ALB, ACM cert, target group, ASG",
+      note: "Verify cert validation completed automatically via Route53, and that all 3 targets reach healthy.",
+    },
+    {
+      id: "s9",
+      label: "aws-lab-app — CloudWatch alarms and SNS",
+      note: "Confirm the email subscription by clicking the link; an unconfirmed subscription fails silently.",
+    },
+    {
+      id: "s10",
+      label: "Prove spoke isolation before declaring the build done",
+      note: "From app: `curl --max-time 5 10.30.10.x` must time out. From dev: the same toward 10.10.10.x. Both must fail, and both must show as silence rather than REJECT.",
+    },
+  ]}
+/>
+
+<Callout id="destroy-callout" tone="warning">
+
+**Destroy in reverse, and expect three things to fight you.** Queue destroy runs `app → shared → network → platform`; destroying network first leaves the downstream `tfe_outputs` data sources unresolvable and their destroy plans will error.
+
+- RDS refuses to delete unless `deletion_protection = false` **and** `skip_final_snapshot = true`. Both are set deliberately in this lab; in anything real they are the opposite.
+- S3 buckets holding ALB access logs and CloudTrail events refuse to delete while non-empty, so both carry `force_destroy = true`.
+- TGW attachments take roughly 5 minutes each to delete and RDS multi-AZ around 10. A full teardown is ~15 minutes, which is normal rather than a hang.
+
+`bootstrap/` is never destroyed.
+
+</Callout>
+
+### Cost
+
+Quoted per hour, because the only number that matters is what a practice session costs. At roughly **$0.54/hour** a three-hour session is about **$1.60**, and leaving it running for a month would be about **$390**.
+
+TGW attachments and VPC interface endpoints are the two largest lines, and both are charged for existing rather than for doing anything — which is precisely why this lab gets destroyed between sessions.
+
+<Table
+  id="cost-table"
+  columns={["Component", "Qty", "$/hr", "Note"]}
+  rows={[
+    [
+      "TGW attachment",
+      "4",
+      "0.200",
+      "$0.05 each. Drops to $0.150 without the dev spoke.",
+    ],
+    [
+      "VPC interface endpoints",
+      "16 ENIs",
+      "0.160",
+      "4 endpoints × (app 3 AZ + shared 1 AZ). Biggest reducible line.",
+    ],
+    ["NAT gateway", "1", "0.045", "Plus $0.045/GB processed."],
+    [
+      "EC2 t3.micro / t3.small",
+      "5",
+      "0.062",
+      "3 app + 1 monitoring (small) + 1 dev.",
+    ],
+    ["RDS db.t3.micro multi-AZ", "1", "0.045", "Includes 2 × 20GB gp3."],
+    ["ALB", "1", "0.023", "Plus LCU, negligible at lab traffic."],
+    [
+      "TGW data processing",
+      "—",
+      "0.02/GB",
+      "Every cross-VPC packet is billable.",
+    ],
+    [
+      "CloudWatch / S3 / CloudTrail",
+      "—",
+      "~0.002",
+      "7-day log retention keeps this near zero.",
+    ],
+    [
+      "Route53 hosted zone",
+      "1",
+      "0.0007",
+      "$0.50/mo, persistent, survives teardown.",
+    ],
+    ["Total", "", "≈ 0.54", "≈ $1.60 per 3-hour session"],
+  ]}
+  density="compact"
+/>
+
+<Callout id="cost-levers" tone="info">
+
+**If you need it cheaper**, in the order I would cut: drop app-VPC endpoints from 3 AZs to 1 (saves $0.08/hr, costs you nothing except AZ-realism on the SSM path); drop the dev spoke (saves $0.06/hr, but it is the only thing that makes isolation demonstrable rather than merely configured — cut it last); run RDS single-AZ (saves $0.017/hr and removes the multi-AZ failover drill). Do not economize by putting SSM endpoints in only the shared VPC — that is the one cut that costs you your shell exactly when you need it.
+
+</Callout>
+
+### Observability, built to prove causes
+
+The point of the logging here is not coverage, it is **discrimination**: given a symptom, which single source distinguishes a routing fault from a security-group fault from a host fault. That constraint drives three non-default choices.
+
+**Flow logs use a custom format.** The default format omits `pkt-srcaddr`, `pkt-dstaddr`, `tcp-flags`, `flow-direction`, and `traffic-path` — which are exactly the fields that separate "the packet never arrived" from "the packet arrived and was refused."
+
+**TGW flow logs are enabled alongside VPC flow logs.** They record which TGW route table made the decision, turning "TGW is probably the problem" into evidence.
+
+**The `logs` interface endpoint is local to each VPC**, not reached over TGW. If CloudWatch ingestion depended on the TGW path, then breaking TGW would also destroy the evidence of breaking TGW.
+
+<Code
+  id="flowlog-code"
+  filename="modules/vpc/flow-logs.tf"
+  language="hcl"
+  caption={
+    "The five fields after ${protocol} are the ones that make RCA possible; none are in the default format."
+  }
+  code={
+    'log_format = join(" ", [\n  "$${version}", "$${vpc-id}", "$${subnet-id}", "$${instance-id}",\n  "$${interface-id}", "$${account-id}", "$${type}",\n  "$${srcaddr}", "$${dstaddr}", "$${srcport}", "$${dstport}",\n  "$${protocol}", "$${bytes}", "$${packets}",\n  "$${start}", "$${end}", "$${action}", "$${log-status}",\n  # --- the fields that actually resolve incidents ---\n  "$${pkt-srcaddr}",    # pre-NAT source: proves whether NAT rewrote it\n  "$${pkt-dstaddr}",    # pre-NAT dest\n  "$${tcp-flags}",      # 2 = SYN only, 18 = SYN-ACK: shows half-open handshakes\n  "$${flow-direction}", # ingress vs egress on this ENI\n  "$${traffic-path}",   # 1=in-VPC 2=IGW 3=VGW 4=intra-region 8=NAT\n])'
+  }
+/>
+
+<Table
+  id="obs-table"
+  columns={[
+    "Source",
+    "Destination",
+    "Non-obvious config",
+    "What only it can prove",
+  ]}
+  rows={[
+    [
+      "VPC flow logs ×4",
+      "CloudWatch Logs, 7d",
+      "Custom format above",
+      "Whether a packet arrived at all, and whether it was refused or ignored",
+    ],
+    [
+      "TGW flow logs",
+      "CloudWatch Logs, 7d",
+      "resource_type = transit-gateway",
+      "Which TGW route table made the decision, and that it was a blackhole",
+    ],
+    [
+      "ALB access logs",
+      "S3, force_destroy",
+      "SSE-S3, not SSE-KMS with a CMK",
+      "Per-request target, latency, and target status codes — but NOT TLS handshake failures",
+    ],
+    [
+      "CloudTrail",
+      "S3 multi-region trail",
+      "force_destroy on the bucket",
+      "Who changed a security group or terminated an instance, and exactly when",
+    ],
+    [
+      "CloudWatch agent",
+      "CloudWatch Logs via local endpoint",
+      "Config stored in SSM Parameter Store, fetched with -c ssm:<param>",
+      "/var/log/httpd/*, /var/log/messages, and disk_used_percent",
+    ],
+    [
+      "CloudWatch alarms",
+      "SNS → email",
+      "treat_missing_data on the 5xx alarms",
+      "That the failure was visible to monitoring — or, for the cert scenario, that it was not",
+    ],
+  ]}
+  density="compact"
+/>
+
+<Callout id="journald-callout" tone="warning">
+
+**journald needs a bridge, or you will ship nothing and not notice.** The CloudWatch agent reads log _files_; the systemd journal is a binary format it cannot parse. Pointing `logs.collect_list` at `/var/log/journal` produces a working agent, a healthy-looking config, and zero events.
+
+Set `ForwardToSyslog=yes` in `/etc/systemd/journald.conf` so rsyslog writes plain text to `/var/log/messages`, and have the agent tail that. This is worth doing wrong once on purpose — silent log pipelines are a genuinely common production failure, and the only symptom is absence.
+
+</Callout>
+
+### Failure injection scenarios
+
+Each row is a Terraform variable or a single CLI call, so scenarios are reproducible and revert cleanly. Run them one at a time against a known-good build.
+
+Read the last column as the answer key — do the diagnosis first, then check whether the evidence you used is the evidence that actually discriminates.
+
+<Table
+  id="fail-table"
+  columns={[
+    "#",
+    "Scenario",
+    "Trigger",
+    "What breaks",
+    "Symptom at the ALB",
+    "Log source that proves it",
+  ]}
+  rows={[
+    [
+      "1",
+      "Missing TGW route",
+      "Remove 10.20.0.0/16 → shared from tgw-rt-app",
+      "App cannot reach RDS",
+      "502/504; HTTPCode_Target_5XX_Count climbs; targets go unhealthy",
+      "App-VPC flow log shows ACCEPT to 10.20.10.x:3306. Shared-VPC flow log shows NO matching record. Silence at the destination = routing.",
+    ],
+    [
+      "2",
+      "Blackholed default route",
+      "blackhole = true on 0.0.0.0/0 in tgw-rt-app",
+      "New instances cannot fetch WordPress during user-data",
+      "ASG launch → health-check fail → replace, looping; UnHealthyHostCount = desired; ALB 503",
+      "TGW route state reads blackhole directly. /var/log/cloud-init-output.log via SSM — reachable only because the endpoints are local.",
+    ],
+    [
+      "3",
+      "RDS security group closed",
+      "Remove the 3306 ingress rule",
+      "Connections refused at the database",
+      "500 from targets; targets may stay HEALTHY if the health check does not touch the DB",
+      "Shared-VPC flow log on the RDS ENI shows REJECT. REJECT at the destination = security group. This is the discriminator against #1.",
+    ],
+    [
+      "4",
+      "AZ instance termination",
+      "terminate-instance-in-auto-scaling-group for all instances in az-b",
+      "One third of capacity",
+      "UnHealthyHostCount spike then recovery; TargetResponseTime bump; no 5xx if the other AZs absorb it",
+      "CloudTrail TerminateInstances plus ASG activity history. ALB metrics split by the AvailabilityZone dimension show where load went.",
+    ],
+    [
+      "5",
+      "Full disk",
+      "fallocate -l 8G /var/log/filler on one instance",
+      "httpd cannot write; the CloudWatch agent stops shipping",
+      "Intermittent 5xx from one target only; low but nonzero HTTPCode_Target_5XX_Count",
+      "disk_used_percent from the CW agent — which is NOT collected by default and must be configured. The gap in IncomingLogEvents is itself the signal.",
+    ],
+    [
+      "6",
+      "Expired certificate",
+      "Swap the listener cert for a self-signed one with a past notAfter",
+      "TLS handshake fails at the ALB",
+      "NOTHING. No 5xx, targets healthy, latency normal, and the request never appears in access logs",
+      "ClientTLSNegotiationErrorCount on the ALB, and ACM DaysToExpiry. Confirm from outside with openssl s_client -connect.",
+    ],
+  ]}
+  density="compact"
+/>
+
+<Callout id="cert-callout" tone="decision">
+
+**Scenario 6 is the most valuable one in the set, and it is the one that looks like nothing.** A TLS handshake that fails is rejected before the ALB ever produces a request, so it generates no access-log line, no target response, and no 5xx. Every dashboard stays green while the site is completely unreachable.
+
+That gap is the lesson: _you cannot alarm on the absence of requests unless you decide to._ The lab therefore also alarms on `RequestCount` dropping to zero, which is the only signal that catches this class of failure.
+
+Two mechanical notes. ACM will not import an already-expired certificate, so the swap uses a self-signed cert generated with a past `notAfter` and attached to the listener directly. And an ALB does **not** validate backend certificates at all — so an expired cert on the _targets_ changes nothing, which is why this scenario has to live on the frontend listener to be observable.
+
+</Callout>
+
+### Traps worth knowing before you hit them
+
+These are the ones you specifically asked about, plus the neighbours that tend to bite at the same time.
+
+<TabsBlock
+  id="gotchas-tabs"
+  tabs={[
+    {
+      id: "g-tgw",
+      label: "TGW attachments",
+      blocks: [
+        {
+          id: "g-tgw-body",
+          type: "rich-text",
+          data: {
+            markdown:
+              "**Attachment subnets decide which AZs work.** A TGW delivers traffic into an AZ only if the attachment has a subnet in that AZ. An attachment covering only az-a means traffic destined for an az-c instance takes an extra cross-AZ hop inside the VPC — and if that AZ's subnet is missing entirely, traffic to instances there fails while identical traffic to az-a succeeds. That asymmetry is maddening to debug, so all multi-AZ attachments here cover all three.\n\n**Changing an attachment's subnets forces replacement**, which briefly severs the spoke. Get the subnet list right the first time rather than discovering it during an apply.\n\n**Appliance mode is not needed here.** It exists for stateful inspection appliances that require flow affinity. A NAT gateway does not need it, and enabling it adds latency for no benefit — but it is a fair interview question about when you *would*.\n\n**The single NAT sits in az-a while attachments span three AZs**, so egress from az-b and az-c takes a cross-AZ hop inside the egress VPC. That is a deliberate cost trade, not an oversight, and it is worth being able to say so.",
+          },
+        },
+      ],
+    },
+    {
+      id: "g-rds",
+      label: "RDS subnet groups",
+      blocks: [
+        {
+          id: "g-rds-body",
+          type: "rich-text",
+          data: {
+            markdown:
+              "**The subnet group must span at least two AZs** or the instance will not create at all — and for multi-AZ it needs a subnet in the AZ the standby lands in, which you do not choose. All three data subnets go in the group.\n\n**Changing the subnet group replaces the instance.** With `skip_final_snapshot = true`, that replacement silently destroys your data. Fine here, catastrophic anywhere else.\n\n**A subnet group cannot be deleted while any instance references it**, so a partial destroy that fails midway can leave you unable to re-apply cleanly. If that happens, delete the instance first and re-run.\n\n**Credentials go in SSM Parameter Store as a SecureString**, generated by `random_password` and read at boot by the instance profile. Parameter Store is free at this scale and avoids the seven-day deletion window that makes Secrets Manager awkward to re-create with the same name during rapid rebuilds.",
+          },
+        },
+      ],
+    },
+    {
+      id: "g-ssm",
+      label: "SSM endpoints vs NAT",
+      blocks: [
+        {
+          id: "g-ssm-body",
+          type: "rich-text",
+          data: {
+            markdown:
+              "**Session Manager needs three endpoints — `ssm`, `ssmmessages`, `ec2messages` — and missing `ssmmessages` is the classic error**, because the agent registers successfully and appears healthy in Fleet Manager while sessions refuse to open.\n\n**Private DNS requires both `enableDnsSupport` and `enableDnsHostnames` on the VPC.** Without them the endpoint exists, resolves to the public IP, and quietly routes over your NAT instead.\n\n**Endpoint private DNS does not work across VPCs over TGW.** A VPC without its own endpoint resolves `ssm.us-east-1.amazonaws.com` to the public address regardless of what its neighbour has. Sharing endpoints cross-VPC requires Route53 Resolver rules — which is why each instance-bearing VPC gets its own set.\n\n**The egress hub gets no endpoints**, because it runs no instances. It is easy to build all three VPCs identically out of habit and pay $0.04/hr for nothing.\n\n**Endpoint security groups need 443 inbound from the VPC CIDR.** The default SG will not do it, and the failure looks like a hung session rather than a refused one.\n\nThe reason all of this earns its cost: local endpoints mean SSM and CloudWatch Logs both survive every TGW and NAT failure you inject. You keep your shell, and you keep the evidence.",
+          },
+        },
+      ],
+    },
+    {
+      id: "g-alb",
+      label: "ALB behaviour",
+      blocks: [
+        {
+          id: "g-alb-body",
+          type: "rich-text",
+          data: {
+            markdown:
+              "**Cross-zone load balancing is always on for an ALB at the load-balancer level and cannot be disabled** — that is an NLB feature. It *can* be disabled per target group via `load_balancing_cross_zone_enabled`, which is the knob that changes how scenario 4 behaves: leave it on and losing an AZ is invisible in per-target load, turn it off and you can watch the surviving AZs carry uneven traffic. Worth toggling once to see both.\n\n**An internet-facing ALB requires an IGW in the app VPC**, which coexists with centralized egress: the public subnets route 0.0.0.0/0 to the IGW for ALB replies, while the private subnets route it to the TGW. Ingress is local, egress is centralized. Pointing the public subnets at the TGW breaks the ALB in a way that looks like a health-check problem.\n\n**WordPress returns a 302 on `/` before installation completes**, so a health-check matcher of `200` fails every target on a fresh build. Use `200-399`.\n\n**Access-log delivery is a common silent failure.** The bucket policy needs the regional ELB service principal, and the bucket must not use SSE-KMS with a customer-managed key. When it is misconfigured, logs simply never appear — there is no error surfaced anywhere on the load balancer.",
+          },
+        },
+      ],
+    },
+  ]}
+  orientation="vertical"
+/>
+
+### Verification
+
+The build is not done when `terraform apply` succeeds — it is done when the load-bearing claims have been tested. Run these from an SSM session on an app instance unless noted.
+
+<Checklist
+  id="verify-checklist"
+  items={[
+    {
+      id: "v1",
+      label:
+        "End-to-end: `curl -sSI https://lab.<yourdomain>` returns 200 or 302 with a valid cert",
+      note: "From your laptop, not from inside the VPC. This exercises DNS, ACM, the ALB, the target group, the ASG, and WordPress in one call.",
+    },
+    {
+      id: "v2",
+      label: "The database path really crosses the TGW",
+      note: "`mysql -h <rds-endpoint> -e 'SELECT 1'` from an app instance, then confirm the flow appears in the shared VPC's flow log with the app instance's private IP as srcaddr.",
+    },
+    {
+      id: "v3",
+      label: "Egress really goes through the hub NAT",
+      note: "`curl -sS https://checkip.amazonaws.com` must return the NAT gateway's Elastic IP — not an app-VPC address, which would mean a stray IGW route.",
+    },
+    {
+      id: "v4",
+      label: "Spoke isolation holds in both directions",
+      note: "`curl --max-time 5 http://10.30.10.x` from app must time out, and the reverse from dev must too. Both should show as silence in the destination flow log, never REJECT.",
+    },
+    {
+      id: "v5",
+      label: "SSM survives a broken TGW",
+      note: "Blackhole 0.0.0.0/0 in tgw-rt-app, confirm the session stays alive and new sessions still open, then revert. If this fails, fix it before running any other scenario.",
+    },
+    {
+      id: "v6",
+      label: "CloudWatch agent is actually shipping",
+      note: "`aws logs tail /aws/ec2/app --since 5m --follow` should show httpd and /var/log/messages events. An empty stream here means the journald bridge is missing.",
+    },
+    {
+      id: "v7",
+      label: "Alarms fire and reach you",
+      note: "`aws cloudwatch set-alarm-state --alarm-name alb-5xx --state-value ALARM` and confirm the email arrives. An unconfirmed SNS subscription fails silently.",
+    },
+    {
+      id: "v8",
+      label: "Full destroy and rebuild in one sitting",
+      note: "Queue destroys app → shared → network, then re-apply in order and re-run v1. Rebuild should be ~15 min. This is the check that the lab is actually reusable rather than a one-shot build.",
+    },
+  ]}
+/>
+
+### Decisions
+
+All four questions are answered. Every one landed on the recommended option, so nothing
+above needs rework — but the reasoning is recorded here so the choices are defensible later
+rather than merely made.
+
+<Table
+  id="settled-decisions"
+  columns={["Question", "Decision", "What it buys", "Cost"]}
+  rows={[
+    [
+      "Fourth VPC (dev spoke)",
+      "Add it — 10.30.0.0/16, one t3.micro",
+      "Isolation becomes provable: a curl that must time out plus a matching absence in the flow logs. Without it the route tables are correct but never tested.",
+      "+$0.06/hr",
+    ],
+    [
+      "WordPress uploaded content",
+      "Stateless — no EFS",
+      "Uploads die on instance replacement. That is realistic-broken, keeps the focus on TGW, and hands you a legitimate seventh scenario for free.",
+      "$0",
+    ],
+    [
+      "AMI and bootstrap",
+      "Amazon Linux 2023 + user-data",
+      "SSM Agent preinstalled, CloudWatch agent one dnf away. WordPress is fetched at boot, which is what keeps the NAT and TGW path load-bearing during launch — scenario 2 depends on it.",
+      "$0",
+    ],
+    [
+      "Prometheus scrape scope",
+      "node_exporter on app instances, over the TGW",
+      "A second, independent witness. Grafana goes blank when shared to app routing breaks, exercising the return direction of the design rather than decorating it.",
+      "$0",
+    ],
+  ]}
+/>
+
+<Callout id="dev-spoke-consequence" tone="decision">
+
+**The dev spoke is load-bearing for the thing this lab is meant to prove.** Adding it means
+`envs/network/` builds four VPC attachments and four TGW route tables, not three — and
+`tgw-rt-app` must have **no** route to `10.30.0.0/16` while `tgw-rt-dev` has **no** route to
+`10.10.0.0/16`. Those two absences *are* the isolation control. A propagated route or a
+default association would silently reinstate them, which is why default association and
+default propagation are both disabled on the TGW.
+
+The dev spoke needs only one subnet and one `/28` attachment subnet in a single AZ. It is an
+isolation prover, not a workload.
+
+</Callout>
+
+<Callout id="stateless-consequence" tone="warning">
+
+Stateless WordPress means the ALB must not depend on sticky sessions to look healthy, and
+any media you upload while demonstrating the lab will vanish the next time the ASG replaces
+an instance. That is intended. Do not "fix" it by adding EFS mid-session — it would add a
+second failure domain while you are trying to isolate a routing one.
+
+</Callout>
+
+### Still open
+
+<QuestionForm
+  id="open-questions"
+  questions={[
+    {
+      id: "module-1-notes",
+      title: "Anything you want changed before I start on module 1?",
+      subtitle:
+        "Last call before bootstrap/ gets written — naming conventions, tagging scheme, or a different build order.",
+      mode: "freeform",
+      placeholder:
+        "Constraints, naming conventions, things you would rather build in a different order...",
+    },
+  ]}
+  submitLabel="Send answers"
+/>

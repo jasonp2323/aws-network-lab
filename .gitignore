@@ -1,0 +1,30 @@
+# Local Plan bridge token — ephemeral, per-serve
+plans/*/.plan-url
+
+# Review chatter, consumed then discarded
+plans/*/comments.json
+
+# Derived from plan.mdx by `plan local preview`
+plans/*/preview.html
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.terraformrc
+terraform.rc
+
+# bootstrap/ uses local state — never commit it, it holds the OIDC role
+# (.terraform.lock.hcl is deliberately NOT ignored; provider pins belong in git)
+bootstrap/terraform.tfstate*
+
+# Never commit these
+*.tfvars
+!example.tfvars
+*.pem
+*.key
+
+# IDE
+.idea/
